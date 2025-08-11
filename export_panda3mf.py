@@ -20,12 +20,75 @@ class Export3MF(Operator, ExportHelper):
 
         model_ns = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
         ET.register_namespace('', model_ns)
+        ns = "{%s}" % model_ns
 
-        model = ET.Element("{%s}model" % model_ns, attrib={"unit": "millimeter"})
-        resources = ET.SubElement(model, "resources")
-        build = ET.SubElement(model, "build")
+        def rgba_to_hex_with_alpha(color):
+            r, g, b, a = color
+            ri = max(0, min(255, int(round(r * 255))))
+            gi = max(0, min(255, int(round(g * 255))))
+            bi = max(0, min(255, int(round(b * 255))))
+            ai = max(0, min(255, int(round(a * 255))))
+            return f"#{ri:02X}{gi:02X}{bi:02X}{ai:02X}"
 
-        for idx, obj in enumerate(mesh_objects, start=1):
+        def get_material_color(mat):
+            color = (1.0, 1.0, 1.0, 1.0)
+            if mat is None:
+                return color
+            if mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.bl_idname == "ShaderNodeBsdfPrincipled":
+                        try:
+                            val = node.inputs.get("Base Color")
+                            if val is not None:
+                                dv = val.default_value
+                                if isinstance(dv, (tuple, list)) and len(dv) >= 3:
+                                    a = dv[3] if len(dv) > 3 else 1.0
+                                    return (dv[0], dv[1], dv[2], a)
+                        except Exception:
+                            pass
+            if hasattr(mat, "diffuse_color"):
+                dv = mat.diffuse_color
+                if isinstance(dv, (tuple, list)) and len(dv) >= 3:
+                    a = dv[3] if len(dv) > 3 else 1.0
+                    return (dv[0], dv[1], dv[2], a)
+            return color
+
+        model = ET.Element(ns + "model", attrib={"unit": "millimeter"})
+        resources = ET.SubElement(model, ns + "resources")
+        build = ET.SubElement(model, ns + "build")
+        components = ET.SubElement(model, ns + "components")  # NUEVO: componentes para ensamblaje
+
+        base_materials = ET.SubElement(resources, ns + "basematerials", attrib={"id": "1"})
+
+        material_map = {}
+        material_list = []
+
+        for obj in mesh_objects:
+            for mat in obj.data.materials:
+                if mat is None:
+                    continue
+                if mat.name not in material_map:
+                    idx = len(material_map)
+                    material_map[mat.name] = idx
+                    material_list.append(mat)
+                    col = get_material_color(mat)
+                    hexcol = rgba_to_hex_with_alpha(col)
+                    ET.SubElement(base_materials, ns + "base", attrib={
+                        "name": mat.name,
+                        "displaycolor": hexcol
+                    })
+
+        if not material_list:
+            material_map["__default_white__"] = 0
+            material_list.append(None)
+            ET.SubElement(base_materials, ns + "base", attrib={
+                "name": "DefaultWhite",
+                "displaycolor": "#FFFFFFFF"
+            })
+
+        object_id_counter = 1
+
+        for obj in mesh_objects:
             depsgraph = context.evaluated_depsgraph_get()
             eval_obj = obj.evaluated_get(depsgraph)
             mesh = eval_obj.to_mesh()
@@ -36,34 +99,62 @@ class Export3MF(Operator, ExportHelper):
             bm.to_mesh(mesh)
             bm.free()
 
-            object_elem = ET.SubElement(resources, "object", attrib={
-                "id": str(idx),
-                "pid": "1",
-                "type": "model",
-                "name": obj.name
-            })
+            faces_by_matname = {}
+            for poly in mesh.polygons:
+                midx = poly.material_index
+                mat = mesh.materials[midx] if midx < len(mesh.materials) else None
+                mat_name = mat.name if mat else "__default_white__"
+                faces_by_matname.setdefault(mat_name, []).append(poly)
 
-            mesh_elem = ET.SubElement(object_elem, "mesh")
-            vertices_elem = ET.SubElement(mesh_elem, "vertices")
-            triangles_elem = ET.SubElement(mesh_elem, "triangles")
-
-            for v in mesh.vertices:
-                ET.SubElement(vertices_elem, "vertex", attrib={
-                    "x": format(v.co.x, '.6f'),
-                    "y": format(v.co.y, '.6f'),
-                    "z": format(v.co.z, '.6f')
+            for mat_name, faces in faces_by_matname.items():
+                mat_index = material_map.get(mat_name, 0)
+                object_elem = ET.SubElement(resources, ns + "object", attrib={
+                    "id": str(object_id_counter),
+                    "type": "model",
+                    "name": f"{obj.name}_{mat_name}",
+                    "pid": "1",
+                    "pindex": str(mat_index)
                 })
 
-            for poly in mesh.polygons:
-                if len(poly.vertices) == 3:
-                    verts = poly.vertices
-                    ET.SubElement(triangles_elem, "triangle", attrib={
-                        "v1": str(verts[0]),
-                        "v2": str(verts[1]),
-                        "v3": str(verts[2])
+                mesh_elem = ET.SubElement(object_elem, ns + "mesh")
+                vertices_elem = ET.SubElement(mesh_elem, ns + "vertices")
+                triangles_elem = ET.SubElement(mesh_elem, ns + "triangles")
+
+                vert_map = {}
+                new_idx = 0
+                for face in faces:
+                    for vid in face.vertices:
+                        if vid not in vert_map:
+                            v = mesh.vertices[vid]
+                            vert_map[vid] = new_idx
+                            new_idx += 1
+                            ET.SubElement(vertices_elem, ns + "vertex", attrib={
+                                "x": format(v.co.x, '.6f'),
+                                "y": format(v.co.y, '.6f'),
+                                "z": format(v.co.z, '.6f')
+                            })
+
+                for face in faces:
+                    rem = [vert_map[vid] for vid in face.vertices]
+                    ET.SubElement(triangles_elem, ns + "triangle", attrib={
+                        "v1": str(rem[0]),
+                        "v2": str(rem[1]),
+                        "v3": str(rem[2])
                     })
 
-            ET.SubElement(build, "item", attrib={"objectid": str(idx)})
+                # Agregar componente para este objeto con transform identidad
+                ET.SubElement(components, ns + "component", attrib={
+                    "objectid": str(object_id_counter),
+                    "transform": "1 0 0 0 1 0 0 0 1 0 0 0"
+                })
+
+                # Agregar item en build para referenciar el componente
+                ET.SubElement(build, ns + "item", attrib={
+                    "objectid": str(object_id_counter),
+                    "componentid": str(object_id_counter)
+                })
+
+                object_id_counter += 1
 
             eval_obj.to_mesh_clear()
 
@@ -88,5 +179,5 @@ class Export3MF(Operator, ExportHelper):
             self.report({'ERROR'}, f"Error escribiendo archivo 3MF: {e}")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, "Exportación 3MF compatible con slicers completada.")
+        self.report({'INFO'}, "Exportación 3MF completada")
         return {'FINISHED'}

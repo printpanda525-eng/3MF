@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Panda 3MF Import/Export",
     "author": "Panda Print",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (2, 80, 0),
     "location": "File > Import-Export",
     "description": "Importa y exporta archivos 3MF",
